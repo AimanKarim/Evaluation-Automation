@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+openai
+gspread
+google-auth
+google-api-python-client
+pdfplumber
+PyMuPDF
+python-dotenv
