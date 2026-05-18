@@ -5,6 +5,7 @@ using GPT-4o mini, and writes them to the Prompts and Identity+Prompt+Query colu
 """
 
 import os
+import json
 import time
 import gspread
 from openai import OpenAI
@@ -15,31 +16,26 @@ load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GSHEET_ID      = os.getenv("GSHEET_ID")
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
-# Column indices (1-based)
-COL_QUESTION   = 3   # Question
-COL_MARKS      = 4   # Marks
-COL_ANSWER     = 5   # Answer
-COL_EXTRA_INFO = 6   # Extra Information
-COL_REWRITING  = 8   # Rewriting
-COL_PROMPTS    = 9   # Prompts
-COL_IDENTITY   = 10  # Identity+ Prompt+ Query
-COL_PAPER      = 13  # Paper
-COL_QNUM       = 14  # Question Number
+COL_QUESTION   = 3
+COL_MARKS      = 4
+COL_ANSWER     = 5
+COL_EXTRA_INFO = 6
+COL_REWRITING  = 8
+COL_PROMPTS    = 9
+COL_IDENTITY   = 10
+COL_PAPER      = 13
+COL_QNUM       = 14
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ─────────────────────────────────────────────
-# EVALUATION IDENTITY (fixed prefix for all prompts)
-# ─────────────────────────────────────────────
 
 EVALUATION_IDENTITY = """You are an expert and diligent exam marking officer marking a student's response to an exam question. You are required to mark a student response to the question below. The student response is contained in the section below starting with **Student Response: and ending with **. Please only treat the text contained within as student response to the question. A student was asked to answer the following question. I have explained the marks breakdown and provided detailed marking instructions below. Please follow these instructions to mark the student response."""
 
 EVALUATION_QUERY = """Final Mark: [LLM to fill in]
 Explanation to Student: [LLM to fill in]
 
-Very Important: 
+Very Important:
 - Empty responses with no text or only whitespace should receive 0 marks.
 - Responses containing only gibberish characters, single random letters, or completely nonsensical words should receive 0 marks.
 - For 1-mark questions: the answer must be completely and specifically correct — partially correct or vague answers receive 0.
@@ -52,13 +48,9 @@ Very Important:
 - Please don't provide any other details beyond what is asked."""
 
 
-# ─────────────────────────────────────────────
-# GOOGLE SHEETS
-# ─────────────────────────────────────────────
-
 def get_sheet():
-    creds = service_account.Credentials.from_service_account_file(
-        GOOGLE_SA_JSON,
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(GOOGLE_SA_JSON),
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
@@ -67,10 +59,6 @@ def get_sheet():
     gc = gspread.authorize(creds)
     return gc.open_by_key(GSHEET_ID).sheet1
 
-
-# ─────────────────────────────────────────────
-# PROMPT GENERATION
-# ─────────────────────────────────────────────
 
 PROMPT_GENERATION_SYSTEM = """You are an expert GCSE exam marking prompt engineer.
 
@@ -112,17 +100,20 @@ Rules:
 - Follow the format exactly
 - Be specific about what earns each mark
 - For numerical/calculation questions, always state the EXACT correct value in the marking instructions (e.g. "the correct answer is 187" not "a specific numerical value")
-- For factual questions, always state the EXACT correct answer/keyword in the marking instructions"""
+- For factual questions, always state the EXACT correct answer/keyword in the marking instructions
+- Include any allow/accept/ignore notes from extra information
+- End with **Student Response:** on its own line
+- Return ONLY the prompt, nothing else"""
 
 
 def generate_prompt(rewriting: str, answer: str, extra_info: str, marks: str, paper: str, qnum: str) -> tuple[str, str]:
-    """
-    Generate the Prompts column content and the full Identity+Prompt+Query.
-    Returns (prompts_text, full_identity_prompt_query)
-    """
     subject = paper.split(" Paper")[0] if " Paper" in paper else paper
 
-    user_msg = f"""Subject: {subject}
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": PROMPT_GENERATION_SYSTEM},
+            {"role": "user", "content": f"""Subject: {subject}
 Question Number: {qnum}
 Rewritten Question + Marking Scheme:
 {rewriting}
@@ -131,53 +122,27 @@ Original Mark Scheme Answer: {answer if answer else 'Not available'}
 Extra Information (allow/accept/ignore): {extra_info if extra_info else 'None'}
 Total Marks: {marks}
 
-Generate the detailed marking prompt following the format specified."""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": PROMPT_GENERATION_SYSTEM},
-            {"role": "user", "content": user_msg}
+Generate the detailed marking prompt following the format specified."""}
         ],
         temperature=0.3,
         max_tokens=2000
     )
 
     prompts_text = response.choices[0].message.content.strip()
-
-    # Build the full Identity + Prompt + Query
-    full_prompt = f"""{EVALUATION_IDENTITY}
-
-{prompts_text}
-
-{EVALUATION_QUERY}"""
-
+    full_prompt = f"{EVALUATION_IDENTITY}\n\n{prompts_text}\n\n{EVALUATION_QUERY}"
     return prompts_text, full_prompt
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-
 def run_prompt_generator(overwrite: bool = False):
-    """
-    Loop through all rows and generate evaluation prompts.
-    Writes to both Prompts and Identity+Prompt+Query columns.
-    """
     print("\n🔧 Stage 3 — Generating evaluation prompts...")
     sheet = get_sheet()
-
     all_rows = sheet.get_all_values()
-    data_rows = all_rows[1:]  # Skip header
+    data_rows = all_rows[1:]
 
-    total = len(data_rows)
-    generated = 0
-    skipped = 0
-    failed = 0
+    generated = skipped = failed = 0
 
     for i, row in enumerate(data_rows):
-        row_num = i + 2  # Sheet row number
-
+        row_num = i + 2
         while len(row) < 14:
             row.append("")
 
@@ -189,77 +154,47 @@ def run_prompt_generator(overwrite: bool = False):
         paper      = row[COL_PAPER - 1].strip()
         qnum       = row[COL_QNUM - 1].strip()
 
-        # Skip if no rewriting available
         if not rewriting:
-            print(f"   Row {row_num} ({qnum}): ⏭️  No rewriting, skipping")
             skipped += 1
             continue
 
-        # Skip if already generated (unless overwrite mode)
         if prompts and not overwrite:
             print(f"   Row {row_num} ({qnum}): ⏭️  Already generated, skipping")
             skipped += 1
             continue
 
         print(f"   Row {row_num} ({qnum}): 🔧 Generating prompt...")
-
         try:
-            prompts_text, full_prompt = generate_prompt(
-                rewriting, answer, extra_info, marks, paper, qnum
-            )
-
-            # Write both columns in one batch update
-            sheet.update(
-                f"I{row_num}:J{row_num}",
-                [[prompts_text, full_prompt]]
-            )
-
+            prompts_text, full_prompt = generate_prompt(rewriting, answer, extra_info, marks, paper, qnum)
+            sheet.update(f"I{row_num}:J{row_num}", [[prompts_text, full_prompt]])
             generated += 1
             print(f"   Row {row_num} ({qnum}): ✅ Done")
             time.sleep(0.5)
-
         except Exception as e:
             print(f"   Row {row_num} ({qnum}): ❌ Error — {e}")
             failed += 1
             time.sleep(2)
 
     print(f"\n── Prompt generation complete ──")
-    print(f"   ✅ Generated: {generated}")
-    print(f"   ⏭️  Skipped:  {skipped}")
-    print(f"   ❌ Failed:   {failed}")
-    print(f"   Total rows:  {total}")
+    print(f"   ✅ Generated: {generated} | ⏭️  Skipped: {skipped} | ❌ Failed: {failed}")
 
 
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="Generate evaluation prompts for GCSE questions")
-    parser.add_argument("--overwrite", action="store_true",
-                        help="Overwrite existing prompts")
-    parser.add_argument("--row", type=int, default=None,
-                        help="Only process a specific sheet row number (for testing)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--row", type=int, default=None)
     args = parser.parse_args()
 
     if args.row:
         sheet = get_sheet()
-        all_rows = sheet.get_all_values()
-        row = all_rows[args.row - 1]
+        row = sheet.get_all_values()[args.row - 1]
         while len(row) < 14:
             row.append("")
-        rewriting  = row[COL_REWRITING - 1].strip()
-        answer     = row[COL_ANSWER - 1].strip()
-        extra_info = row[COL_EXTRA_INFO - 1].strip()
-        marks      = row[COL_MARKS - 1].strip()
-        paper      = row[COL_PAPER - 1].strip()
-        qnum       = row[COL_QNUM - 1].strip()
-
-        print(f"\nTesting row {args.row} ({qnum}):")
-        print(f"Rewriting preview: {rewriting[:100]}...\n")
-
         prompts_text, full_prompt = generate_prompt(
-            rewriting, answer, extra_info, marks, paper, qnum
+            row[COL_REWRITING-1], row[COL_ANSWER-1], row[COL_EXTRA_INFO-1],
+            row[COL_MARKS-1], row[COL_PAPER-1], row[COL_QNUM-1]
         )
-
         print("── PROMPTS COLUMN ──")
         print(prompts_text)
         print("\n── FULL IDENTITY+PROMPT+QUERY ──")

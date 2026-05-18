@@ -17,9 +17,8 @@ load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GSHEET_ID      = os.getenv("GSHEET_ID")
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
-# Column indices (1-based)
 COL_QUESTION  = 3
 COL_MARKS     = 4
 COL_ANSWER    = 5
@@ -31,10 +30,6 @@ COL_PAPER     = 13
 COL_QNUM      = 14
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ─────────────────────────────────────────────
-# 10 EVALUATION CATEGORIES
-# ─────────────────────────────────────────────
 
 CATEGORIES = [
     "Correct Answer",
@@ -49,13 +44,10 @@ CATEGORIES = [
     "Correct Answer with Formatting/Grammar Issue",
 ]
 
-# ─────────────────────────────────────────────
-# GOOGLE SHEETS
-# ─────────────────────────────────────────────
 
 def get_sheet():
-    creds = service_account.Credentials.from_service_account_file(
-        GOOGLE_SA_JSON,
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(GOOGLE_SA_JSON),
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
@@ -65,13 +57,9 @@ def get_sheet():
     return gc.open_by_key(GSHEET_ID).sheet1
 
 
-# ─────────────────────────────────────────────
-# STEP 1: GENERATE SAMPLE ANSWERS
-# ─────────────────────────────────────────────
-
 def generate_sample_answers(question: str, answer: str, marks: str, rewriting: str) -> dict:
     """Generate one sample answer per category using GPT-4o mini."""
-    print(f"      DEBUG — question: '{question[:80]}'")
+
     system_prompt = """You are an expert GCSE exam answer generator.
 Given a GCSE question and its correct answer, generate realistic sample student WRITTEN answers for each of the 10 evaluation categories.
 
@@ -120,13 +108,11 @@ Generate sample answers for all 10 categories."""
         temperature=0.8,
         max_tokens=4000
     )
-    
+
     raw = response.choices[0].message.content.strip()
-    # Fix literal newlines inside JSON string values
     raw = re.sub(r'("(?:[^"\\]|\\.)*")', lambda m: m.group(0).replace('\n', '\\n'), raw)
     raw = re.sub(r"^```json|^```|```$", "", raw, flags=re.MULTILINE).strip()
-    print(f"      RAW RESPONSE: {raw[:2000]}")
-    
+
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -144,9 +130,11 @@ Generate sample answers for all 10 categories."""
                 {"role": "user", "content": user_msg}
             ],
             temperature=0,
-            max_tokens=2000
+            max_tokens=4000
         )
-        raw2 = re.sub(r"^```json|^```|```$", "", response2.choices[0].message.content.strip(), flags=re.MULTILINE).strip()
+        raw2 = response2.choices[0].message.content.strip()
+        raw2 = re.sub(r'("(?:[^"\\]|\\.)*")', lambda m: m.group(0).replace('\n', '\\n'), raw2)
+        raw2 = re.sub(r"^```json|^```|```$", "", raw2, flags=re.MULTILINE).strip()
         try:
             return json.loads(raw2)
         except:
@@ -154,41 +142,32 @@ Generate sample answers for all 10 categories."""
             return {cat: "" for cat in CATEGORIES}
 
 
-# ─────────────────────────────────────────────
-# STEP 2: RUN EVALUATOR
-# ─────────────────────────────────────────────
-
 def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, category: str = "") -> dict:
-    """
-    Send a student answer to the evaluator and parse the result.
-    Returns {"score": int, "max": int, "feedback": str, "raw": str}
-    """
+    """Send a student answer to the evaluator and parse the result."""
 
-    # ── Category-specific instructions ────────────────────────────────────
     if category == "Correct Answer with Formatting/Grammar Issue":
-        typo_instruction = (
+        extra_instruction = (
             "\n\nIMPORTANT: The student's answer may contain minor typos, spelling mistakes, "
             "or grammar errors. If the core answer is clearly identifiable as correct despite "
             "these errors, award FULL marks. Do NOT penalise for formatting or spelling alone. "
             "Only withhold marks if the meaning of the answer is changed or unclear."
         )
     elif category == "Correct Answer but outside of Points to Discuss":
-        typo_instruction = (
+        extra_instruction = (
             "\n\nIMPORTANT: The student's answer contains the correct answer plus some "
             "additional irrelevant information. Award FULL marks for the correct part. "
             "Do NOT deduct marks because extra information was included — only the "
             "correct answer portion needs to match the mark scheme."
         )
     elif category == "Correct Answer with New Line":
-        typo_instruction = (
+        extra_instruction = (
             "\n\nIMPORTANT: The student's answer may contain extra blank lines or "
             "whitespace before or after the actual answer. Ignore all leading and "
             "trailing whitespace and newlines — evaluate only the text content itself. "
             "If the core answer is correct, award FULL marks."
         )
     else:
-        typo_instruction = ""
-    # ──────────────────────────────────────────────────────────────────────
+        extra_instruction = ""
 
     max_marks_instruction = (
         f"\n\nIMPORTANT: The maximum mark for this question is {max_marks}. "
@@ -198,7 +177,7 @@ def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, categor
     eval_prompt = full_prompt.replace(
         "**Student Response:**",
         f"**Student Response:**\n{student_answer}\n**"
-    ) + typo_instruction + max_marks_instruction
+    ) + extra_instruction + max_marks_instruction
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -218,26 +197,15 @@ def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, categor
     )
 
     raw = response.choices[0].message.content.strip()
-
     score = 0
     match = re.search(r"Final Mark[:\s]+(\d+)\s*(?:/\s*\d+)?", raw, re.IGNORECASE)
     if match:
         score = int(match.group(1))
 
-    return {
-        "score": score,
-        "max": max_marks,
-        "feedback": raw,
-    }
-# ─────────────────────────────────────────────
-# STEP 3: DETERMINE PASS/FAIL PER CATEGORY
-# ─────────────────────────────────────────────
+    return {"score": score, "max": max_marks, "feedback": raw}
+
 
 def evaluate_category_result(category: str, score: int, max_marks: int) -> bool:
-    """
-    Determine if the evaluator passed or failed for a given category.
-    Returns True if the result is as expected, False if unexpected.
-    """
     correct_categories = {
         "Correct Answer",
         "Correct Answer but outside of Points to Discuss",
@@ -256,21 +224,13 @@ def evaluate_category_result(category: str, score: int, max_marks: int) -> bool:
     }
 
     if category in correct_categories:
-        # Should get full marks
         return score == max_marks
     elif category in partial_categories:
-        # Should get some marks but not full.
-        # For 1-mark questions, 0 is the only valid "partial" outcome (no half marks exist).
         return 0 < score < max_marks or (max_marks == 1 and score == 0)
     elif category in zero_categories:
-        # Should get 0 marks
         return score == 0
     return True
 
-
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
 
 def run_tester(overwrite: bool = False, single_row: int = None):
     """Run the automated testing pipeline."""
@@ -279,10 +239,7 @@ def run_tester(overwrite: bool = False, single_row: int = None):
     all_rows = sheet.get_all_values()
     data_rows = all_rows[1:]
 
-    total = 0
-    tested = 0
-    skipped = 0
-    failed = 0
+    total = tested = skipped = 0
 
     for i, row in enumerate(data_rows):
         row_num = i + 2
@@ -314,31 +271,24 @@ def run_tester(overwrite: bool = False, single_row: int = None):
         max_marks = int(marks_str) if marks_str.isdigit() else 1
         print(f"\n   Row {row_num} ({qnum}): 🧪 Testing ({max_marks} marks)...")
 
-        # Step 1: Generate sample answers
         print(f"      Generating sample answers...")
         samples = generate_sample_answers(question, answer, marks_str, rewriting)
         time.sleep(0.5)
 
-        # Step 2 & 3: Run evaluator for each category
         results = {}
         all_passed = True
 
         for category in CATEGORIES:
 
-            # ── FIX 2: Skip 'Partially Correct' for 1-mark questions ──────
-            # There is no partial credit on a 1-mark question, so this
-            # category is not applicable. Auto-pass it and move on.
+            # Skip 'Partially Correct' for 1-mark questions — no partial credit exists
             if category == "Partially Correct with Incorrect Information" and max_marks == 1:
                 results[category] = {
-                    "score":    0,
-                    "max":      max_marks,
-                    "pass":     True,
-                    "answer":   "N/A — skipped for 1-mark questions",
+                    "score": 0, "max": max_marks, "pass": True,
+                    "answer": "N/A — skipped for 1-mark questions",
                     "feedback": "Category not applicable for 1-mark questions.",
                 }
                 print(f"      ⏭️  {category}: skipped (1-mark question)")
                 continue
-            # ──────────────────────────────────────────────────────────────
 
             student_answer = samples.get(category, "")
             if not student_answer:
@@ -346,7 +296,6 @@ def run_tester(overwrite: bool = False, single_row: int = None):
                 all_passed = False
                 continue
 
-            # Pass category so run_evaluator can inject the right instructions
             eval_result = run_evaluator(identity, student_answer, max_marks, category)
             passed = evaluate_category_result(category, eval_result["score"], max_marks)
             if not passed:
@@ -364,7 +313,6 @@ def run_tester(overwrite: bool = False, single_row: int = None):
             print(f"      {status} {category}: {eval_result['score']}/{max_marks}")
             time.sleep(0.3)
 
-        # Step 4: Write results to Scoring column as JSON
         scoring_data = {
             "overall_pass": all_passed,
             "status": "approved" if all_passed else "needs_review",
@@ -373,23 +321,18 @@ def run_tester(overwrite: bool = False, single_row: int = None):
         }
 
         sheet.update_cell(row_num, COL_SCORING, json.dumps(scoring_data))
-        overall = "✅ ALL PASSED" if all_passed else "❌ NEEDS REVIEW"
-        print(f"      {overall}")
+        print(f"      {'✅ ALL PASSED' if all_passed else '❌ NEEDS REVIEW'}")
         tested += 1
         time.sleep(0.5)
 
     print(f"\n── Testing complete ──")
-    print(f"   ✅ Tested:  {tested}")
-    print(f"   ⏭️  Skipped: {skipped}")
-    print(f"   Total:     {total + skipped}")
+    print(f"   ✅ Tested: {tested} | ⏭️  Skipped: {skipped} | Total: {total + skipped}")
 
 
 if __name__ == "__main__":
     import argparse
-
     parser = argparse.ArgumentParser(description="Run automated evaluation testing")
-    parser.add_argument("--overwrite", action="store_true", help="Re-test already tested rows")
-    parser.add_argument("--row", type=int, default=None, help="Test a single sheet row")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--row", type=int, default=None)
     args = parser.parse_args()
-
     run_tester(overwrite=args.overwrite, single_row=args.row)
