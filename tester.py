@@ -2,16 +2,22 @@
 Stage 4 — Automated Testing
 For each question, generates sample answers for all 10 evaluation categories,
 runs them through the evaluator (GPT-4o mini), and records results in the sheet.
+
+Optimisations vs original:
+- Removed all time.sleep() calls
+- All 10 category evaluations run in parallel (ThreadPoolExecutor)
+- Sample answer generation uses max_tokens=4000
+- Literal newline fix applied before JSON parse
 """
 
 import os
 import re
 import json
-import time
 import gspread
 from openai import OpenAI
 from google.oauth2 import service_account
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 
@@ -23,10 +29,8 @@ COL_QUESTION  = 3
 COL_MARKS     = 4
 COL_ANSWER    = 5
 COL_REWRITING = 8
-COL_PROMPTS   = 9
 COL_IDENTITY  = 10
 COL_SCORING   = 11
-COL_PAPER     = 13
 COL_QNUM      = 14
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -57,9 +61,11 @@ def get_sheet():
     return gc.open_by_key(GSHEET_ID).sheet1
 
 
-def generate_sample_answers(question: str, answer: str, marks: str, rewriting: str) -> dict:
-    """Generate one sample answer per category using GPT-4o mini."""
+# ─────────────────────────────────────────────
+# STEP 1: GENERATE SAMPLE ANSWERS
+# ─────────────────────────────────────────────
 
+def generate_sample_answers(question: str, answer: str, marks: str, rewriting: str) -> dict:
     system_prompt = """You are an expert GCSE exam answer generator.
 Given a GCSE question and its correct answer, generate realistic sample student WRITTEN answers for each of the 10 evaluation categories.
 
@@ -80,16 +86,16 @@ Return ONLY a valid JSON object with exactly these 10 keys:
 }
 
 Guidelines for each category:
-- Correct Answer: A perfectly correct written answer e.g. "Organ" or "Light can reach the palisade mesophyll"
+- Correct Answer: A perfectly correct written answer
 - Incorrect Answer: A plausible but completely wrong written answer
-- Incomplete Answer: For 1-mark questions write something TOO VAGUE to earn the mark e.g. "It helps the plant" or "So it can work properly" — deliberately insufficient, not the actual answer
+- Incomplete Answer: For 1-mark questions write something TOO VAGUE to earn the mark — deliberately insufficient
 - Hallucinations: Confidently states made-up false scientific facts
-- Correct Answer but outside of Points to Discuss: Correct answer PLUS extra irrelevant information e.g. "Organ. This is because organs contain cells and DNA."
-- Partially Correct with Incorrect Information: Write an answer that mixes one correct element with a clearly wrong statement. The wrong statement must contradict or undermine the correct part so the overall answer does NOT earn the mark on a 1-mark question. NEVER write a fully correct answer for this category. For multi-mark questions, write something that earns some but not all marks.
+- Correct Answer but outside of Points to Discuss: Correct answer PLUS extra irrelevant information
+- Partially Correct with Incorrect Information: Mix one correct element with a clearly wrong statement that undermines it. NEVER write a fully correct answer for this category. For multi-mark questions, write something that earns some but not all marks.
 - Invalid Answer: Random gibberish like "asdf hjkl" or "123 abc"
-- Correct Answer with New Line: Correct answer but with extra blank lines e.g. "Organ\n\n\n"
+- Correct Answer with New Line: Correct answer with extra blank lines e.g. "Organ\n\n\n"
 - Incorrect Answer with Formatting/Grammar Issue: Wrong answer with spelling/grammar errors
-- Correct Answer with Formatting/Grammar Issue: Correct answer with a minor typo that still makes the answer clearly recognisable e.g. "Organn" or "lite can reech the mesophyll". The core answer must be identifiable as correct despite the error. Do NOT change the meaning — only add superficial typos or spelling mistakes.
+- Correct Answer with Formatting/Grammar Issue: Correct answer with a minor typo still clearly recognisable. Do NOT change the meaning — only add superficial typos.
 
 Return ONLY the JSON object, no markdown, no explanation."""
 
@@ -142,9 +148,11 @@ Generate sample answers for all 10 categories."""
             return {cat: "" for cat in CATEGORIES}
 
 
-def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, category: str = "") -> dict:
-    """Send a student answer to the evaluator and parse the result."""
+# ─────────────────────────────────────────────
+# STEP 2: RUN EVALUATOR (single category)
+# ─────────────────────────────────────────────
 
+def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, category: str = "") -> dict:
     if category == "Correct Answer with Formatting/Grammar Issue":
         extra_instruction = (
             "\n\nIMPORTANT: The student's answer may contain minor typos, spelling mistakes, "
@@ -205,6 +213,10 @@ def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, categor
     return {"score": score, "max": max_marks, "feedback": raw}
 
 
+# ─────────────────────────────────────────────
+# STEP 3: EVALUATE CATEGORY RESULT
+# ─────────────────────────────────────────────
+
 def evaluate_category_result(category: str, score: int, max_marks: int) -> bool:
     correct_categories = {
         "Correct Answer",
@@ -232,8 +244,41 @@ def evaluate_category_result(category: str, score: int, max_marks: int) -> bool:
     return True
 
 
+# ─────────────────────────────────────────────
+# STEP 4: EVALUATE ONE CATEGORY (for parallel execution)
+# ─────────────────────────────────────────────
+
+def evaluate_single_category(category: str, student_answer: str, identity: str, max_marks: int) -> tuple[str, dict]:
+    """Evaluate one category and return (category, result_dict). Used by ThreadPoolExecutor."""
+
+    # Skip Partially Correct for 1-mark questions
+    if category == "Partially Correct with Incorrect Information" and max_marks == 1:
+        return category, {
+            "score": 0, "max": max_marks, "pass": True,
+            "answer": "N/A — skipped for 1-mark questions",
+            "feedback": "Category not applicable for 1-mark questions.",
+        }
+
+    if not student_answer:
+        return category, {"score": 0, "max": max_marks, "pass": False, "answer": "", "feedback": ""}
+
+    eval_result = run_evaluator(identity, student_answer, max_marks, category)
+    passed = evaluate_category_result(category, eval_result["score"], max_marks)
+
+    return category, {
+        "score":    eval_result["score"],
+        "max":      max_marks,
+        "pass":     passed,
+        "answer":   student_answer,
+        "feedback": eval_result["feedback"],
+    }
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
 def run_tester(overwrite: bool = False, single_row: int = None):
-    """Run the automated testing pipeline."""
     print("\n🧪 Stage 4 — Automated testing...")
     sheet = get_sheet()
     all_rows = sheet.get_all_values()
@@ -271,48 +316,39 @@ def run_tester(overwrite: bool = False, single_row: int = None):
         max_marks = int(marks_str) if marks_str.isdigit() else 1
         print(f"\n   Row {row_num} ({qnum}): 🧪 Testing ({max_marks} marks)...")
 
+        # Step 1: Generate sample answers
         print(f"      Generating sample answers...")
         samples = generate_sample_answers(question, answer, marks_str, rewriting)
-        time.sleep(0.5)
 
+        # Step 2: Run all 10 category evaluations in parallel
+        print(f"      Running evaluations in parallel...")
         results = {}
-        all_passed = True
 
-        for category in CATEGORIES:
-
-            # Skip 'Partially Correct' for 1-mark questions — no partial credit exists
-            if category == "Partially Correct with Incorrect Information" and max_marks == 1:
-                results[category] = {
-                    "score": 0, "max": max_marks, "pass": True,
-                    "answer": "N/A — skipped for 1-mark questions",
-                    "feedback": "Category not applicable for 1-mark questions.",
-                }
-                print(f"      ⏭️  {category}: skipped (1-mark question)")
-                continue
-
-            student_answer = samples.get(category, "")
-            if not student_answer:
-                results[category] = {"score": 0, "max": max_marks, "pass": False, "answer": "", "feedback": ""}
-                all_passed = False
-                continue
-
-            eval_result = run_evaluator(identity, student_answer, max_marks, category)
-            passed = evaluate_category_result(category, eval_result["score"], max_marks)
-            if not passed:
-                all_passed = False
-
-            results[category] = {
-                "score":    eval_result["score"],
-                "max":      max_marks,
-                "pass":     passed,
-                "answer":   student_answer,
-                "feedback": eval_result["feedback"],
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {
+                executor.submit(
+                    evaluate_single_category,
+                    category,
+                    samples.get(category, ""),
+                    identity,
+                    max_marks
+                ): category
+                for category in CATEGORIES
             }
 
-            status = "✅" if passed else "❌"
-            print(f"      {status} {category}: {eval_result['score']}/{max_marks}")
-            time.sleep(0.3)
+            for future in as_completed(futures):
+                category, result = future.result()
+                results[category] = result
+                status = "✅" if result["pass"] else "❌"
+                skip = result["answer"] == "N/A — skipped for 1-mark questions"
+                if skip:
+                    print(f"      ⏭️  {category}: skipped (1-mark)")
+                else:
+                    print(f"      {status} {category}: {result['score']}/{result['max']}")
 
+        all_passed = all(r["pass"] for r in results.values())
+
+        # Step 3: Write results
         scoring_data = {
             "overall_pass": all_passed,
             "status": "approved" if all_passed else "needs_review",
@@ -323,7 +359,6 @@ def run_tester(overwrite: bool = False, single_row: int = None):
         sheet.update_cell(row_num, COL_SCORING, json.dumps(scoring_data))
         print(f"      {'✅ ALL PASSED' if all_passed else '❌ NEEDS REVIEW'}")
         tested += 1
-        time.sleep(0.5)
 
     print(f"\n── Testing complete ──")
     print(f"   ✅ Tested: {tested} | ⏭️  Skipped: {skipped} | Total: {total + skipped}")
