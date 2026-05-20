@@ -1,13 +1,8 @@
 """
 Stage 4 — Automated Testing
-For each question, generates sample answers for all 10 evaluation categories,
-runs them through the evaluator (GPT-4o mini), and records results in the sheet.
-
-Optimisations vs original:
-- Removed all time.sleep() calls
-- All 10 category evaluations run in parallel (ThreadPoolExecutor)
-- Sample answer generation uses max_tokens=4000
-- Literal newline fix applied before JSON parse
+For each question in a paper-specific sheet tab, generates sample answers
+for all 10 evaluation categories, runs them through the evaluator in parallel,
+and records results back to the sheet.
 """
 
 import os
@@ -48,17 +43,39 @@ CATEGORIES = [
     "Correct Answer with Formatting/Grammar Issue",
 ]
 
+ZERO_CATEGORIES = {
+    "Incorrect Answer",
+    "Hallucinations",
+    "Invalid Answer",
+    "Incorrect Answer with Formatting/Grammar Issue",
+}
 
-def get_sheet():
+
+def get_sa_info():
+    sa = GOOGLE_SA_JSON.strip()
+    if sa.endswith(".json"):
+        with open(sa) as f:
+            return json.load(f)
+    return json.loads(sa)
+
+
+def get_sheet(paper_label: str = ""):
     creds = service_account.Credentials.from_service_account_info(
-        json.loads(GOOGLE_SA_JSON),
+        get_sa_info(),
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
     )
     gc = gspread.authorize(creds)
-    return gc.open_by_key(GSHEET_ID).sheet1
+    spreadsheet = gc.open_by_key(GSHEET_ID)
+
+    if paper_label:
+        try:
+            return spreadsheet.worksheet(paper_label)
+        except gspread.exceptions.WorksheetNotFound:
+            raise ValueError(f"No tab found for paper '{paper_label}'. Run extractor first.")
+    return spreadsheet.sheet1
 
 
 # ─────────────────────────────────────────────
@@ -69,7 +86,7 @@ def generate_sample_answers(question: str, answer: str, marks: str, rewriting: s
     system_prompt = """You are an expert GCSE exam answer generator.
 Given a GCSE question and its correct answer, generate realistic sample student WRITTEN answers for each of the 10 evaluation categories.
 
-IMPORTANT: Students always TYPE their answers as written text. Even for questions that list options, students write their chosen answer as text (e.g. they write "Organ" not click a box).
+IMPORTANT: Students always TYPE their answers as written text. Even for questions that list options, students write their chosen answer as text.
 
 Return ONLY a valid JSON object with exactly these 10 keys:
 {
@@ -87,21 +104,23 @@ Return ONLY a valid JSON object with exactly these 10 keys:
 
 Guidelines for each category:
 - Correct Answer: A perfectly correct written answer
-- Incorrect Answer: A plausible but completely wrong written answer
+- Incorrect Answer: A plausible but completely wrong written answer. Must NOT contain any correct values or facts from the mark scheme.
 - Incomplete Answer: For 1-mark questions write something TOO VAGUE to earn the mark — deliberately insufficient
-- Hallucinations: Confidently states made-up false scientific facts
+- Hallucinations: Confidently states made-up false scientific facts. Must NOT contain any correct values or facts from the mark scheme.
 - Correct Answer but outside of Points to Discuss: Correct answer PLUS extra irrelevant information
-- Partially Correct with Incorrect Information: Mix one correct element with a clearly wrong statement that undermines it. NEVER write a fully correct answer for this category. For multi-mark questions, write something that earns some but not all marks.
+- Partially Correct with Incorrect Information: Mix one correct element with a clearly wrong statement that undermines it. NEVER write a fully correct answer for this category.
 - Invalid Answer: Random gibberish like "asdf hjkl" or "123 abc"
-- Correct Answer with New Line: Correct answer with extra blank lines e.g. "Organ\n\n\n"
-- Incorrect Answer with Formatting/Grammar Issue: Wrong answer with spelling/grammar errors
-- Correct Answer with Formatting/Grammar Issue: Correct answer with a minor typo still clearly recognisable. Do NOT change the meaning — only add superficial typos.
+- Correct Answer with New Line: Correct answer with extra blank lines
+- Incorrect Answer with Formatting/Grammar Issue: Wrong answer with spelling/grammar errors. Must NOT contain any correct values or facts from the mark scheme.
+- Correct Answer with Formatting/Grammar Issue: Correct answer with a minor typo still clearly recognisable.
 
 Return ONLY the JSON object, no markdown, no explanation."""
 
     user_msg = f"""Question: {rewriting if rewriting else question}
 Correct Answer / Mark Scheme: {answer if answer else 'Not specified'}
 Total Marks: {marks}
+
+CRITICAL: For Incorrect Answer, Incorrect Answer with Formatting/Grammar Issue, and Hallucinations — do NOT use any of the correct values or facts from the mark scheme above. Use completely different numbers and facts.
 
 Generate sample answers for all 10 categories."""
 
@@ -149,7 +168,7 @@ Generate sample answers for all 10 categories."""
 
 
 # ─────────────────────────────────────────────
-# STEP 2: RUN EVALUATOR (single category)
+# STEP 2: RUN EVALUATOR
 # ─────────────────────────────────────────────
 
 def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, category: str = "") -> dict:
@@ -157,21 +176,18 @@ def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, categor
         extra_instruction = (
             "\n\nIMPORTANT: The student's answer may contain minor typos, spelling mistakes, "
             "or grammar errors. If the core answer is clearly identifiable as correct despite "
-            "these errors, award FULL marks. Do NOT penalise for formatting or spelling alone. "
-            "Only withhold marks if the meaning of the answer is changed or unclear."
+            "these errors, award FULL marks. Do NOT penalise for formatting or spelling alone."
         )
     elif category == "Correct Answer but outside of Points to Discuss":
         extra_instruction = (
             "\n\nIMPORTANT: The student's answer contains the correct answer plus some "
             "additional irrelevant information. Award FULL marks for the correct part. "
-            "Do NOT deduct marks because extra information was included — only the "
-            "correct answer portion needs to match the mark scheme."
+            "Do NOT deduct marks because extra information was included."
         )
     elif category == "Correct Answer with New Line":
         extra_instruction = (
-            "\n\nIMPORTANT: The student's answer may contain extra blank lines or "
-            "whitespace before or after the actual answer. Ignore all leading and "
-            "trailing whitespace and newlines — evaluate only the text content itself. "
+            "\n\nIMPORTANT: The student's answer may contain extra blank lines or whitespace. "
+            "Ignore all leading and trailing whitespace and newlines — evaluate only the text content. "
             "If the core answer is correct, award FULL marks."
         )
     else:
@@ -193,8 +209,7 @@ def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, categor
             {
                 "role": "system",
                 "content": (
-                    f"You are an exam marking officer. You must NEVER award more than {max_marks} mark(s) "
-                    f"total for any response. The maximum possible mark is {max_marks}. "
+                    f"You are an exam marking officer. You must NEVER award more than {max_marks} mark(s). "
                     f"Any score above {max_marks} is strictly forbidden."
                 )
             },
@@ -214,7 +229,44 @@ def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, categor
 
 
 # ─────────────────────────────────────────────
-# STEP 3: EVALUATE CATEGORY RESULT
+# STEP 3: TWO-PASS VERIFICATION
+# ─────────────────────────────────────────────
+
+def verify_zero_score(category: str, student_answer: str, correct_answer: str, score: int) -> int:
+    if category not in ZERO_CATEGORIES or score == 0:
+        return score
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a strict mark scheme checker. Reply with only YES or NO. No other text."
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Mark scheme answer: {correct_answer}\n"
+                    f"Student answer: {student_answer}\n\n"
+                    f"Do the EXACT values, facts, and figures in the student answer match "
+                    f"the mark scheme? Even if the method looks right, if any specific "
+                    f"number or fact is different from the mark scheme, answer NO. "
+                    f"Reply YES only if everything matches exactly."
+                )
+            }
+        ],
+        temperature=0,
+        max_tokens=5
+    )
+
+    verdict = response.choices[0].message.content.strip().upper()
+    if "YES" in verdict:
+        return 0
+    return score
+
+
+# ─────────────────────────────────────────────
+# STEP 4: PASS/FAIL LOGIC
 # ─────────────────────────────────────────────
 
 def evaluate_category_result(category: str, score: int, max_marks: int) -> bool:
@@ -228,30 +280,28 @@ def evaluate_category_result(category: str, score: int, max_marks: int) -> bool:
         "Incomplete Answer",
         "Partially Correct with Incorrect Information",
     }
-    zero_categories = {
-        "Incorrect Answer",
-        "Hallucinations",
-        "Invalid Answer",
-        "Incorrect Answer with Formatting/Grammar Issue",
-    }
 
     if category in correct_categories:
         return score == max_marks
     elif category in partial_categories:
         return 0 < score < max_marks or (max_marks == 1 and score == 0)
-    elif category in zero_categories:
+    elif category in ZERO_CATEGORIES:
         return score == 0
     return True
 
 
 # ─────────────────────────────────────────────
-# STEP 4: EVALUATE ONE CATEGORY (for parallel execution)
+# STEP 5: EVALUATE SINGLE CATEGORY (parallel)
 # ─────────────────────────────────────────────
 
-def evaluate_single_category(category: str, student_answer: str, identity: str, max_marks: int) -> tuple[str, dict]:
-    """Evaluate one category and return (category, result_dict). Used by ThreadPoolExecutor."""
+def evaluate_single_category(
+    category: str,
+    student_answer: str,
+    identity: str,
+    max_marks: int,
+    correct_answer: str,
+) -> tuple[str, dict]:
 
-    # Skip Partially Correct for 1-mark questions
     if category == "Partially Correct with Incorrect Information" and max_marks == 1:
         return category, {
             "score": 0, "max": max_marks, "pass": True,
@@ -260,9 +310,14 @@ def evaluate_single_category(category: str, student_answer: str, identity: str, 
         }
 
     if not student_answer:
-        return category, {"score": 0, "max": max_marks, "pass": False, "answer": "", "feedback": ""}
+        return category, {
+            "score": 0, "max": max_marks, "pass": False,
+            "answer": "", "feedback": ""
+        }
 
     eval_result = run_evaluator(identity, student_answer, max_marks, category)
+    verified_score = verify_zero_score(category, student_answer, correct_answer, eval_result["score"])
+    eval_result["score"] = verified_score
     passed = evaluate_category_result(category, eval_result["score"], max_marks)
 
     return category, {
@@ -278,9 +333,9 @@ def evaluate_single_category(category: str, student_answer: str, identity: str, 
 # MAIN
 # ─────────────────────────────────────────────
 
-def run_tester(overwrite: bool = False, single_row: int = None):
+def run_tester(overwrite: bool = False, single_row: int = None, paper_label: str = ""):
     print("\n🧪 Stage 4 — Automated testing...")
-    sheet = get_sheet()
+    sheet = get_sheet(paper_label)
     all_rows = sheet.get_all_values()
     data_rows = all_rows[1:]
 
@@ -316,11 +371,9 @@ def run_tester(overwrite: bool = False, single_row: int = None):
         max_marks = int(marks_str) if marks_str.isdigit() else 1
         print(f"\n   Row {row_num} ({qnum}): 🧪 Testing ({max_marks} marks)...")
 
-        # Step 1: Generate sample answers
         print(f"      Generating sample answers...")
         samples = generate_sample_answers(question, answer, marks_str, rewriting)
 
-        # Step 2: Run all 10 category evaluations in parallel
         print(f"      Running evaluations in parallel...")
         results = {}
 
@@ -331,7 +384,8 @@ def run_tester(overwrite: bool = False, single_row: int = None):
                     category,
                     samples.get(category, ""),
                     identity,
-                    max_marks
+                    max_marks,
+                    answer,
                 ): category
                 for category in CATEGORIES
             }
@@ -339,16 +393,15 @@ def run_tester(overwrite: bool = False, single_row: int = None):
             for future in as_completed(futures):
                 category, result = future.result()
                 results[category] = result
-                status = "✅" if result["pass"] else "❌"
                 skip = result["answer"] == "N/A — skipped for 1-mark questions"
                 if skip:
                     print(f"      ⏭️  {category}: skipped (1-mark)")
                 else:
+                    status = "✅" if result["pass"] else "❌"
                     print(f"      {status} {category}: {result['score']}/{result['max']}")
 
         all_passed = all(r["pass"] for r in results.values())
 
-        # Step 3: Write results
         scoring_data = {
             "overall_pass": all_passed,
             "status": "approved" if all_passed else "needs_review",
@@ -369,5 +422,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run automated evaluation testing")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--row", type=int, default=None)
+    parser.add_argument("--paper", type=str, default="", help="Paper label (sheet tab name)")
     args = parser.parse_args()
-    run_tester(overwrite=args.overwrite, single_row=args.row)
+    run_tester(overwrite=args.overwrite, single_row=args.row, paper_label=args.paper)
