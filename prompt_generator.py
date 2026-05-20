@@ -1,7 +1,7 @@
 """
 Stage 3 — Evaluation Prompt Generator
-Reads rewritten questions from Google Sheet, generates full evaluation prompts
-using GPT-4o mini, and writes them to the Prompts and Identity+Prompt+Query columns.
+Reads rewritten questions from a paper-specific Google Sheet tab,
+generates full evaluation prompts using GPT-4o mini, and writes them back.
 """
 
 import os
@@ -48,16 +48,31 @@ Very Important:
 - Please don't provide any other details beyond what is asked."""
 
 
-def get_sheet():
+def get_sa_info():
+    sa = GOOGLE_SA_JSON.strip()
+    if sa.endswith(".json"):
+        with open(sa) as f:
+            return json.load(f)
+    return json.loads(sa)
+
+
+def get_sheet(paper_label: str = ""):
     creds = service_account.Credentials.from_service_account_info(
-        json.loads(GOOGLE_SA_JSON),
+        get_sa_info(),
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
     )
     gc = gspread.authorize(creds)
-    return gc.open_by_key(GSHEET_ID).sheet1
+    spreadsheet = gc.open_by_key(GSHEET_ID)
+
+    if paper_label:
+        try:
+            return spreadsheet.worksheet(paper_label)
+        except gspread.exceptions.WorksheetNotFound:
+            raise ValueError(f"No tab found for paper '{paper_label}'. Run extractor first.")
+    return spreadsheet.sheet1
 
 
 PROMPT_GENERATION_SYSTEM = """You are an expert GCSE exam marking prompt engineer.
@@ -133,9 +148,9 @@ Generate the detailed marking prompt following the format specified."""}
     return prompts_text, full_prompt
 
 
-def run_prompt_generator(overwrite: bool = False):
+def run_prompt_generator(overwrite: bool = False, paper_label: str = ""):
     print("\n🔧 Stage 3 — Generating evaluation prompts...")
-    sheet = get_sheet()
+    sheet = get_sheet(paper_label)
     all_rows = sheet.get_all_values()
     data_rows = all_rows[1:]
 
@@ -169,7 +184,7 @@ def run_prompt_generator(overwrite: bool = False):
             sheet.update(f"I{row_num}:J{row_num}", [[prompts_text, full_prompt]])
             generated += 1
             print(f"   Row {row_num} ({qnum}): ✅ Done")
-            time.sleep(0.5)
+            time.sleep(0.3)
         except Exception as e:
             print(f"   Row {row_num} ({qnum}): ❌ Error — {e}")
             failed += 1
@@ -184,10 +199,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--row", type=int, default=None)
+    parser.add_argument("--paper", type=str, default="", help="Paper label (sheet tab name)")
     args = parser.parse_args()
 
     if args.row:
-        sheet = get_sheet()
+        sheet = get_sheet(args.paper)
         row = sheet.get_all_values()[args.row - 1]
         while len(row) < 14:
             row.append("")
@@ -200,4 +216,4 @@ if __name__ == "__main__":
         print("\n── FULL IDENTITY+PROMPT+QUERY ──")
         print(full_prompt)
     else:
-        run_prompt_generator(overwrite=args.overwrite)
+        run_prompt_generator(overwrite=args.overwrite, paper_label=args.paper)

@@ -30,14 +30,33 @@ SHEET_HEADERS = [
 # GOOGLE DRIVE
 # ─────────────────────────────────────────────
 
-def get_drive_service():
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
+def get_sheet(sheet_id: str, paper_label: str = ""):
+    sa = GOOGLE_SA_JSON.strip()
+    if sa.endswith(".json"):
+        with open(sa) as f:
+            sa_info = json.load(f)
+    else:
+        sa_info = json.loads(sa)
     creds = service_account.Credentials.from_service_account_info(
-        json.loads(GOOGLE_SA_JSON),
-        scopes=["https://www.googleapis.com/auth/drive"]
+        sa_info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
     )
-    return build("drive", "v3", credentials=creds)
+    gc = gspread.authorize(creds)
+    spreadsheet = gc.open_by_key(sheet_id)
+
+    if paper_label:
+        # Find existing tab or create new one
+        try:
+            sheet = spreadsheet.worksheet(paper_label)
+        except gspread.exceptions.WorksheetNotFound:
+            sheet = spreadsheet.add_worksheet(title=paper_label, rows=200, cols=20)
+    else:
+        sheet = spreadsheet.sheet1
+
+    return sheet
 
 
 def upload_image_to_drive(image_path: str, filename: str, drive_service) -> str:
@@ -382,10 +401,13 @@ def extract_pdf(
     print(f"   ✅ Merged into {len(merged_rows)} rows")
 
     if write_to_sheet and GSHEET_ID:
-        sheet = get_sheet(GSHEET_ID)
+        sheet = get_sheet(GSHEET_ID, paper_label)
         append_rows_to_sheet(sheet, merged_rows, paper_label=paper_label)
 
     return merged_rows
+
+
+
 
 
 # ─────────────────────────────────────────────
