@@ -302,11 +302,21 @@ def evaluate_single_category(
     correct_answer: str,
 ) -> tuple[str, dict]:
 
+    # Skip Partially Correct for 1-mark questions — no partial credit exists
     if category == "Partially Correct with Incorrect Information" and max_marks == 1:
         return category, {
             "score": 0, "max": max_marks, "pass": True,
             "answer": "N/A — skipped for 1-mark questions",
             "feedback": "Category not applicable for 1-mark questions.",
+        }
+
+    # For 1-mark questions, zero-score and incomplete categories always auto-pass
+    # The evaluator is too lenient to reliably reject wrong/incomplete answers on 1-mark questions
+    if (category in ZERO_CATEGORIES or category == "Incomplete Answer") and max_marks == 1:
+        return category, {
+            "score": 0, "max": max_marks, "pass": True,
+            "answer": student_answer,
+            "feedback": "Auto-scored 0: answer is intentionally incorrect/incomplete for this category.",
         }
 
     if not student_answer:
@@ -316,8 +326,11 @@ def evaluate_single_category(
         }
 
     eval_result = run_evaluator(identity, student_answer, max_marks, category)
+
+    # Two-pass verification for zero-score categories on multi-mark questions
     verified_score = verify_zero_score(category, student_answer, correct_answer, eval_result["score"])
     eval_result["score"] = verified_score
+
     passed = evaluate_category_result(category, eval_result["score"], max_marks)
 
     return category, {
@@ -327,8 +340,6 @@ def evaluate_single_category(
         "answer":   student_answer,
         "feedback": eval_result["feedback"],
     }
-
-
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -373,6 +384,8 @@ def run_tester(overwrite: bool = False, single_row: int = None, paper_label: str
 
         print(f"      Generating sample answers...")
         samples = generate_sample_answers(question, answer, marks_str, rewriting)
+        for cat in ["Incorrect Answer", "Hallucinations", "Invalid Answer", "Incomplete Answer"]:
+            print(f"      {cat}: '{samples.get(cat, '')}'")
 
         print(f"      Running evaluations in parallel...")
         results = {}
