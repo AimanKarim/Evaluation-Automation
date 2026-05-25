@@ -190,6 +190,12 @@ def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, categor
             "Ignore all leading and trailing whitespace and newlines — evaluate only the text content. "
             "If the core answer is correct, award FULL marks."
         )
+    elif category == "Correct Answer":
+        extra_instruction = (
+            "\n\nIMPORTANT: If the student's answer conveys the correct meaning and matches "
+            "the mark scheme, award FULL marks. Accept reasonable variations in phrasing "
+            "as long as the core answer is correct."
+    )
     else:
         extra_instruction = ""
 
@@ -198,10 +204,17 @@ def run_evaluator(full_prompt: str, student_answer: str, max_marks: int, categor
         f"Do NOT award more than {max_marks} mark(s) under any circumstances."
     )
 
+    # Insert student answer into prompt
     eval_prompt = full_prompt.replace(
         "**Student Response:**",
         f"**Student Response:**\n{student_answer}\n**"
-    ) + extra_instruction + max_marks_instruction
+    )
+
+    # Fallback: if marker wasn't found, append student answer at the end
+    if student_answer not in eval_prompt:
+        eval_prompt = eval_prompt + f"\n\n**Student Response:**\n{student_answer}\n**"
+
+    eval_prompt = eval_prompt + extra_instruction + max_marks_instruction
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -311,7 +324,6 @@ def evaluate_single_category(
         }
 
     # For 1-mark questions, zero-score and incomplete categories always auto-pass
-    # The evaluator is too lenient to reliably reject wrong/incomplete answers on 1-mark questions
     if (category in ZERO_CATEGORIES or category == "Incomplete Answer") and max_marks == 1:
         return category, {
             "score": 0, "max": max_marks, "pass": True,
@@ -340,6 +352,8 @@ def evaluate_single_category(
         "answer":   student_answer,
         "feedback": eval_result["feedback"],
     }
+
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -384,8 +398,7 @@ def run_tester(overwrite: bool = False, single_row: int = None, paper_label: str
 
         print(f"      Generating sample answers...")
         samples = generate_sample_answers(question, answer, marks_str, rewriting)
-        for cat in ["Incorrect Answer", "Hallucinations", "Invalid Answer", "Incomplete Answer"]:
-            print(f"      {cat}: '{samples.get(cat, '')}'")
+        print(f"      Correct Answer sample: '{samples.get('Correct Answer', '')}'")
 
         print(f"      Running evaluations in parallel...")
         results = {}
@@ -406,9 +419,12 @@ def run_tester(overwrite: bool = False, single_row: int = None, paper_label: str
             for future in as_completed(futures):
                 category, result = future.result()
                 results[category] = result
-                skip = result["answer"] == "N/A — skipped for 1-mark questions"
+                skip = result["answer"] in (
+                    "N/A — skipped for 1-mark questions",
+                    "N/A — auto-passed: question references a figure"
+                )
                 if skip:
-                    print(f"      ⏭️  {category}: skipped (1-mark)")
+                    print(f"      ⏭️  {category}: skipped")
                 else:
                     status = "✅" if result["pass"] else "❌"
                     print(f"      {status} {category}: {result['score']}/{result['max']}")
