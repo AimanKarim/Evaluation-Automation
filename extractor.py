@@ -2,6 +2,7 @@
 GCSE Exam PDF Extraction Engine
 Extracts questions, sub-parts, marks, answers, and figures from GCSE exam PDFs.
 Uploads figures to Google Drive and writes structured data to Google Sheets.
+Each paper gets its own tab in the spreadsheet.
 """
 
 import os
@@ -27,36 +28,29 @@ SHEET_HEADERS = [
 
 
 # ─────────────────────────────────────────────
-# GOOGLE DRIVE
+# HELPERS
 # ─────────────────────────────────────────────
 
-def get_sheet(sheet_id: str, paper_label: str = ""):
+def get_sa_info():
     sa = GOOGLE_SA_JSON.strip()
     if sa.endswith(".json"):
         with open(sa) as f:
-            sa_info = json.load(f)
-    else:
-        sa_info = json.loads(sa)
+            return json.load(f)
+    return json.loads(sa)
+
+
+# ─────────────────────────────────────────────
+# GOOGLE DRIVE
+# ─────────────────────────────────────────────
+
+def get_drive_service():
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
     creds = service_account.Credentials.from_service_account_info(
-        sa_info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
+        get_sa_info(),
+        scopes=["https://www.googleapis.com/auth/drive"]
     )
-    gc = gspread.authorize(creds)
-    spreadsheet = gc.open_by_key(sheet_id)
-
-    if paper_label:
-        # Find existing tab or create new one
-        try:
-            sheet = spreadsheet.worksheet(paper_label)
-        except gspread.exceptions.WorksheetNotFound:
-            sheet = spreadsheet.add_worksheet(title=paper_label, rows=200, cols=20)
-    else:
-        sheet = spreadsheet.sheet1
-
-    return sheet
+    return build("drive", "v3", credentials=creds)
 
 
 def upload_image_to_drive(image_path: str, filename: str, drive_service) -> str:
@@ -89,18 +83,30 @@ def upload_image_to_drive(image_path: str, filename: str, drive_service) -> str:
 # GOOGLE SHEETS
 # ─────────────────────────────────────────────
 
-def get_sheet(sheet_id: str):
+def get_sheet(sheet_id: str, paper_label: str = ""):
     import gspread
     from google.oauth2 import service_account
     creds = service_account.Credentials.from_service_account_info(
-        json.loads(GOOGLE_SA_JSON),
+        get_sa_info(),
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
     )
     gc = gspread.authorize(creds)
-    return gc.open_by_key(sheet_id).sheet1
+    spreadsheet = gc.open_by_key(sheet_id)
+
+    if paper_label:
+        try:
+            sheet = spreadsheet.worksheet(paper_label)
+            print(f"   📋 Using existing tab: '{paper_label}'")
+        except gspread.exceptions.WorksheetNotFound:
+            sheet = spreadsheet.add_worksheet(title=paper_label, rows=200, cols=20)
+            print(f"   📋 Created new tab: '{paper_label}'")
+    else:
+        sheet = spreadsheet.sheet1
+
+    return sheet
 
 
 def ensure_headers(sheet):
@@ -112,16 +118,11 @@ def ensure_headers(sheet):
 def append_rows_to_sheet(sheet, rows: list[dict], paper_label: str = ""):
     ensure_headers(sheet)
 
-    if paper_label:
-        all_rows = sheet.get_all_values()
-        rows_to_delete = []
-        for i, row in enumerate(all_rows[1:], start=2):
-            if len(row) >= 13 and row[12] == paper_label:
-                rows_to_delete.append(i)
-        for row_num in reversed(rows_to_delete):
-            sheet.delete_rows(row_num)
-        if rows_to_delete:
-            print(f"🗑️  Deleted {len(rows_to_delete)} existing rows for '{paper_label}'")
+    # Clear existing data rows (keep header)
+    all_rows = sheet.get_all_values()
+    if len(all_rows) > 1:
+        sheet.delete_rows(2, len(all_rows))
+        print(f"   🗑️  Cleared existing rows in tab '{paper_label}'")
 
     values = []
     for i, row in enumerate(rows, start=1):
@@ -142,7 +143,7 @@ def append_rows_to_sheet(sheet, rows: list[dict], paper_label: str = ""):
             row.get("sub_part", ""),
         ])
     sheet.append_rows(values, value_input_option="RAW")
-    print(f"✅ Written {len(values)} rows to Google Sheet.")
+    print(f"   ✅ Written {len(values)} rows to tab '{paper_label}'.")
 
 
 # ─────────────────────────────────────────────
@@ -209,7 +210,7 @@ Paper: """ + paper_label
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"⚠️  JSON parse error on page: {e}\nRaw response: {raw[:300]}")
+        print(f"   ⚠️  JSON parse error on page: {e}")
         return []
 
 
@@ -218,11 +219,10 @@ def extract_answers_with_gpt(page_text: str, paper_label: str) -> list[dict]:
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     system_prompt = """You are an expert GCSE marking scheme parser.
-You will be given text from a GCSE marking scheme page.
-Extract every answer entry.
+Extract every answer entry from this marking scheme page.
 
 Return a JSON array. Each item:
-- question_number: string e.g. "1", "10.4"
+- question_number: string e.g. "01.1", "02.3"
 - sub_part: string e.g. "a", "b", or ""
 - answer: the correct answer(s), exactly as written
 - extra_info: any "allow", "accept", "do not accept" notes
@@ -405,9 +405,6 @@ def extract_pdf(
         append_rows_to_sheet(sheet, merged_rows, paper_label=paper_label)
 
     return merged_rows
-
-
-
 
 
 # ─────────────────────────────────────────────
